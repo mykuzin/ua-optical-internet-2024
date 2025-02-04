@@ -1,0 +1,486 @@
+---
+title: "Покриття населених пунктів оптичним інтернетом у 2024 році"
+format: html
+---
+
+```{r include = FALSE}
+library(tidyverse)
+library(arrow)
+library(readxl)
+library(stringi)
+library(sf)
+library(showtext)
+library(Cairo)
+
+```
+
+### Чому оптичний інтернет важливий
+
+У проєкті "Стратегії розвитку сфери електронних комунікацій України на період до 2030"[^1] розвиток гігабітної інтернет-інфраструктури винесений у дві стратегічні цілі: покриття 75% домогосподарств і проникнення для 99% соціальних закладів (покриття — технічна можливість підключитися, проникнення — фактичне підключення). Оскільки соціальні заклади є майже в кожному населеному пункті, можливість підключитися до гігабітного інтернету до 2030 року має бути доступною практично в кожному селі чи селищі.
+
+[^1]: [проєкт](https://thedigital.gov.ua/storage/uploads/files/%D0%A1%D1%82%D1%80%D0%B0%D1%82%D0%B5%D0%B3%D1%96%D1%8F:15:05.pdf) Стратегії розвитку сфери електронних комунікацій України на період до 2030 року, презентований у травні 2024.
+
+Гігабітне підключення здатні сьогодні забезпечити декілька технологій широкосмугового доступу: оптоволоконні мережі (FTTx/xPON), телевізійні кабельні (при найсучаснішому стандарті DOCSIS 4.0), бездротові 5G-мережі і ряд інших, менш поширених.
+
+Хоча кожна технологія має свої випадки застосування, загалом, якщо йдеться про покриття менших населених пунктів надійним і якісним інтернет-доступом, оптоволоконні мережі виграють завдяки довговічності, низькій деградації сигналу на великих відстанях, простішому способу модернізації мережі, енергоефективності тощо.
+
+### Джерела даних і підхід до оцінки покриття
+
+Для аналізу покриття населених пунктів оптичним інтернетом використані такі джерела даних:
+
+1.  **Регуляторна звітність провайдерів за формою 1-Т**, період 2021-2024Q2.\
+    Оскільки під час дії воєнного стану провайдери не зобов'язані подавати звітність, населений пункт вважається із оптичним інтернетом, якщо принаймні за один квартал у цей період провайдери звітували про підключення абонентів за технологією FTTx/xPON.
+
+    ```{r include = FALSE}
+    setwd(Sys.getenv('LOCAL_WD_GEN_USE_DATA'))
+
+    kodyf <- read_xlsx("kodyficator_clean_Dec2024.xlsx")
+
+    pidkontr_np_jan25 <- read_xlsx("under_ua_control_2025_01_09_isw.xlsx")
+
+    pidkontr_np_jan25 <- 
+    pidkontr_np_jan25 |>
+      left_join(
+        kodyf |> mutate(ADM4_PCODE = str_sub(geo_katottg_adm_4, 1, 12)),
+        join_by(ADM4_PCODE)
+      ) |> filter(!is.na(geo_katottg_adm_1))
+      
+      # t1
+
+    t1_raw <- read_parquet("1t_agg.parquet")
+
+    t1 <- t1_raw |> select(edrpou, firm_name = c_name, year = YEAR, geo_katottg4 = geo_koatuu,
+                           starts_with("cnt"), 
+                           firm_type = c_type) |>
+      select(-contains("speed"), -cnt_abonents__fiz, -cnt_abonents__total,
+             -cnt_abn_fftx, - cnt_abn_xpon) 
+
+    t1 <- t1 |> filter(!is.na(geo_katottg4))
+
+    t1 <- 
+    t1 |> mutate(
+      across(starts_with("cnt"), as.numeric),
+      across(starts_with("cnt"), ~ replace_na(., 0))
+    ) 
+
+    t1 <- t1 |> 
+      mutate(cnt_abn_other_all = (cnt_abn_docsiss + cnt_abn_radio +
+                                         cnt_abn_xdsl + cnt_abn_starlink + 
+                                         cnt_abn_other)) |>
+      select(edrpou, firm_name, firm_type, year, geo_katottg4, cnt_abn_other_all,
+             cnt_abn_xponfftx)
+
+    t1_wide <- 
+    t1 |> pivot_wider(
+      names_from = year, values_from = starts_with("cnt")
+    ) |> mutate(
+      across(starts_with("cnt"), as.numeric),
+      across(starts_with("cnt"), ~ replace_na(., 0)))
+
+    t1_wide <- 
+    t1_wide |>
+      summarise(across(starts_with("cnt"), sum),
+                .by = geo_katottg4)
+
+    t1_wide <- 
+    t1_wide |>
+      mutate(
+        other_all_per = if_else(rowSums(across(contains("other"))) > 0, 1, 0),
+        optical_all_per = if_else(rowSums(across(contains("xpon"))) > 0, 1, 0),
+        other_all_per = if_else(optical_all_per == 1, 0, other_all_per),
+        internet_type = case_when(
+          optical_all_per == 1 ~ 'optical',
+          other_all_per == 1 ~ 'other',
+          .default = "no_internet"
+        )
+        )
+
+    t1_wide |> count(internet_type) 
+
+    ua_optical_t1 <- 
+    pidkontr_np_jan25 |>
+      left_join(t1_wide,
+                join_by(geo_katottg_adm_4 == geo_katottg4)) |>
+      mutate(internet_type = if_else(is.na(internet_type), 
+                                     "no_internet", internet_type))
+
+    ua_optical_t1 |> count(internet_type) |> arrange(desc(n))
+    ```
+
+2.  Набір у форматі відкритих даних із [**результатами тестів швидкості**](https://registry.opendata.aws/speedtest-global-performance/) **для фіксованого Інтернет від Ookla**, період 2019-2024, щоквартальні дані.\
+    Компанія викладає у публічний доступ набір геопросторових даних, що містять інформацію про середню швидкість завантаження та вивантаження (upload), затримку, кількість проведених тестів, кількість пристроїв з яких проводилися тести тощо. Ця інформація дається на кожну плитку, отриману через проєкцію Меркатор із 16-м рівнем наближення — для України розмір такої плитки складає приблизно 400x900 метрів.\
+    Припущення про наявність оптичного інтернету у населеному пункті на основі цих даних зроблено у випадку, якщо швидкість завантаження[^2] там реєструвалася більше 100 мб/с принаймні раз за період спостережень. Щоб асоціювати плитку з населеним пунктом, точкові координати центру плитки накладені на адміністративні межі населеного пункту.
+
+    ```{r include = FALSE}
+    setwd(Sys.getenv("LOCAL_WD_OOKLA_PRIV"))
+
+    avg_d_kbps_more_than_100 <- read_xlsx("ookla_ua_bbox_2019_2024_more_than100mbps.xlsx")
+
+    avg_100mbps_distinct_coord <- 
+      avg_d_kbps_more_than_100 |> distinct(tile_x, tile_y)
+
+    avg_100mbps_distinct_coord_sf <- 
+      avg_100mbps_distinct_coord %>%
+      st_as_sf(coords = c("tile_x", "tile_y"), crs = 4326)
+
+    # населені пункти
+
+    setwd(Sys.getenv('LOCAL_WD_ADMIN_BOUND'))
+
+    ua_np <- sf::read_sf("ukr_admbnda_adm4_sspe_20240416.shp")
+
+    ua_np <- ua_np |> select(ADM4_PCODE)
+    ua_np <- st_make_valid(ua_np)
+
+
+    st_crs(ua_np) == st_crs(avg_100mbps_distinct_coord_sf)
+
+    joined_data <- st_join(avg_100mbps_distinct_coord_sf, ua_np, join = st_intersects) |>
+      filter(!is.na(ADM4_PCODE))
+
+    joined_data |> distinct(ADM4_PCODE)
+
+    joined_data |>
+      mutate(long = geometry[, "X"],
+             lat = geometry[, "Y"])
+
+    joined_data <- 
+     joined_data |>
+       mutate(coords = st_coordinates(geometry))
+     
+    joined_data$tile_x <- joined_data$coords[, "X"]
+    joined_data$tile_y <- joined_data$coords[, "Y"] 
+     
+    joined_data <- joined_data |> st_drop_geometry() |> select(-coords)
+
+    avg_d_kbps_more_than_100 <- 
+    avg_d_kbps_more_than_100 |> 
+      left_join(joined_data, join_by(tile_x, tile_y)) |> 
+      filter(!is.na(ADM4_PCODE))
+
+    avg_d_kbps_more_than_100 <- 
+    avg_d_kbps_more_than_100 |>
+      left_join(
+        kodyf |> mutate(ADM4_PCODE = str_sub(geo_katottg_adm_4, 1, 12)),
+        join_by(ADM4_PCODE)
+      )
+
+    avg_d_kbps_more_than_100 |> 
+      filter(is.na(geo_katottg_adm_1)) |>
+      distinct(ADM4_PCODE)
+
+    # "UA8000000000" - м. Київ
+    # "UA8500000000" - м. Севастополь
+
+    avg_d_kbps_more_than_100[avg_d_kbps_more_than_100$ADM4_PCODE == "UA8000000000", 
+                             "geo_katottg_adm_4"] <- 'UA80000000000093317'
+
+    avg_d_kbps_more_than_100[avg_d_kbps_more_than_100$ADM4_PCODE == "UA8500000000", 
+                             "geo_katottg_adm_4"] <- 'UA85000000000065278'
+
+
+    # подивитиcь, як швидкість змінювалась
+
+    agg_avg_d <- 
+    avg_d_kbps_more_than_100 |>
+      summarise(
+        median_d_kbps_all_per = median(avg_d_kbps),
+        avg_d_kbps_all_per = mean(avg_d_kbps),
+        total_devices = sum(devices),
+        log_total_devices = log(total_devices + 1),
+        total_tests = sum(tests),
+        .by = c(geo_katottg_adm_4, ADM4_PCODE)
+      )
+
+    quant_99_total_devices <- quantile(agg_avg_d$total_devices, probs = .99)
+
+    agg_avg_d |>
+      filter(total_devices < quant_99_total_devices) |> 
+      ggplot() + geom_histogram(aes(x = total_devices), bins = 1000)
+
+
+    # об'єдную т1 і уклівський набір; дістаю центри полігонів (точки нп) 
+
+    agg_fin_sf <- 
+    ua_np |>
+      left_join(ua_optical_t1 |> select(internet_type, ADM4_PCODE),
+                join_by(ADM4_PCODE)) |> 
+      left_join(agg_avg_d,
+                join_by(ADM4_PCODE)) |> 
+      st_centroid()
+
+    agg_fin_sf |> st_drop_geometry() |> count(internet_type) |> arrange(desc(n))
+
+    agg_fin_sf <- 
+    agg_fin_sf |>
+      rename(internet_type_t1 = internet_type) |>
+      mutate(
+        internet_type_ookla = if_else(!is.na(avg_d_kbps_all_per), "optical", NA),
+        internet_type = case_when(
+          internet_type_t1 == 'optical' & internet_type_ookla == 'optical' ~ 'optical_both',
+          internet_type_t1 == 'optical' ~ 'optical_t1',
+          internet_type_t1 == 'other' ~ 'other_tech_t1',
+          internet_type_ookla == 'optical' ~ 'optical_ookla',
+          .default = 'no_optical_or_no_data'
+          )
+        )
+       
+    st_crs(agg_fin_sf) <- 4326
+
+    agg_fin_sf <- agg_fin_sf |> 
+      select(-c(internet_type_t1, internet_type_ookla, geo_katottg_adm_4))
+
+    agg_fin_sf |> st_drop_geometry() |> count(internet_type) |> arrange(desc(n))
+
+    agg_fin_sf |> filter(!is.na(log_total_devices)) |>
+      summarise(min_log_total_devices = min(log_total_devices)) # 0.693
+
+    agg_fin_sf[agg_fin_sf$ADM4_PCODE == 'UA8000000000', "internet_type"] <- 'optical_both'
+
+    agg_plot_sf <- 
+      agg_fin_sf |> select(log_total_devices, internet_type) |>
+      mutate(log_total_devices = if_else(is.na(log_total_devices), 0.693, log_total_devices))
+
+    setwd(Sys.getenv('LOCAL_WD_ADMIN_BOUND'))
+
+    # державні кордони
+
+    ua_borders <- st_read("ukr_admbnda_adm0_sspe_20240416.shp", promote_to_multi = FALSE)
+
+    st_crs(ua_borders)
+
+    ua_borders <- st_transform(ua_borders, crs = 4326)
+
+    class(ua_borders$geometry)
+
+    ua_borders <- ua_borders |> st_cast("POLYGON")
+
+    ua_borders <- st_union(ua_borders)
+
+    ua_borders_idx <- st_make_valid(ua_borders) %>% 
+      st_transform(4326)
+
+    setwd(Sys.getenv('LOCAL_WD_GEN_USE_DATA'))
+
+    ua_oblasts <- st_read("ADMIN_1.geojson") |> 
+      select(geo_oblast = ADMIN_1, geo_katottg1 = COD_1, geometry) |>
+      mutate(geo_oblast = str_extract(geo_oblast, regex("^\\S+")))
+
+    ua_oblasts <- ua_oblasts[-c(26,27), ]
+    ua_oblasts[25, 1] <- "місто Київ"
+
+    ua_oblasts <- ua_oblasts[order(ua_oblasts$geo_oblast), ]
+
+    ua_oblasts <- st_transform(ua_oblasts, crs = 4326)
+
+    ua_oblasts_idx <- st_make_valid(ua_oblasts) %>% 
+      st_transform(4326)
+
+    unique(agg_plot_sf$internet_type)
+
+    inet_type_colors <- c(
+      "no_optical_or_no_data" = '#C32F27',
+      "optical_both" = '#2C4875',
+      "optical_t1" = '#4A6670',
+      "other_tech_t1" = '#6B4C45',
+      "optical_ookla" = '#4DAA57'
+    )
+
+    agg_plot_sf |> count(internet_type)
+    ```
+
+3.  **Лінія зіткнення** взята в Інституту вивчення війни (ISW), який щоденно оновлює дані і викладає їх [публічно](https://services5.arcgis.com/SaBe5HMtmnbqSWlu/ArcGIS/rest/services/VIEW_RussiaCoTinUkraine_V3/FeatureServer/49). Ця інформація використана, щоб поділити населені пункти на підконтрольні і непідконтрольні (набір Мінреінтеграції так часто не оновлюється). Ці дані взяті станом на 25 січня 2025 року.
+
+4.  **Адміністративні кордони** різних рівнів взяті з публічного [датасету](https://data.humdata.org/dataset/cod-ab-ukr) від ДНВП "Картографія", викладеного Управлінням ООН з координації гуманітарних справ.
+
+[^2]: можливо краще взяти швидкість вивантаження/upload, оскільки оптоволоконні технології пропонують симетричні швидкості завантаження та вивантаження — на відміну від інших.
+
+### Мапа з оцінкою покриття оптичним інтернетом
+
+Станом на кінець 2024 року, на основі описаних джерел та припущень, мапа оптичного Інтернет в Україні виглядає так:
+
+```{r echo = FALSE}
+font_add_google("Roboto", "roboto")
+showtext_auto()
+
+optical_map_plot <- 
+ggplot() +
+  geom_sf(data = ua_borders_idx, fill = NA, color = "gray40", linewidth = 0.3) +
+  geom_sf(data = ua_oblasts_idx, fill = NA, color = "gray60", linewidth = 0.2) +
+  geom_sf(data = agg_plot_sf, 
+          aes(size = log_total_devices,
+              color = internet_type),
+          alpha = 0.8) +
+  scale_size_continuous(
+    range = c(0.5, 2),
+    name = "Кількість пристроїв\nлише дані від Ookla, лог.",
+    breaks = function(x) round(seq(min(x), max(x), length.out = 4), 1)
+  ) +
+
+  scale_color_manual(
+    values = inet_type_colors,
+    name = "Тип підключення — колір",
+    breaks = c(
+      "optical_both",
+      "optical_t1",
+      "optical_ookla",
+      "other_tech_t1",
+      "no_optical_or_no_data"
+    ), 
+    labels = c(
+      "optical_ookla" = "Є оптика (лише Ookla)",
+      "no_optical_or_no_data" = "Немає оптики/даних",
+      "optical_both" = "Є оптика (обидва джерела)",
+      "optical_t1" = "Є оптика (лише 1-Т)",
+      "other_tech_t1" = "Інші технології (лише 1-Т)"
+    )
+  ) +
+  
+ theme_minimal() +
+  theme(
+    text = element_text(family = "roboto"),
+    plot.title = element_text(face = "bold", size = 16, margin = margin(b = 10)),
+    plot.subtitle = element_text(size = 12, color = "gray30", margin = margin(b = 20)),
+    plot.caption = element_text(size = 8, color = "gray40", lineheight = 1.2, margin = margin(t = 20)),
+    
+    # Adjust legend spacing and layout
+    legend.position = "bottom",
+    legend.spacing.x = unit(0.2, "cm"), 
+    legend.spacing.y = unit(0.1, "cm"),
+    legend.margin = margin(t = 5, r = 5, b = 5, l = 5), 
+    legend.key.size = unit(0.5, "cm"),   
+    legend.box.spacing = unit(0.1, "cm"),
+    legend.title.position = "top",
+    legend.title = element_text(hjust = 0.5, size = 11), 
+    legend.text = element_text(size = 10),  
+  ) +
+  guides(
+    color = guide_legend(
+      order = 1,
+      override.aes = list(
+        size = 3,  
+        shape = 15
+      ),
+      ncol = 2,   
+      keywidth = unit(0.8, "cm"),  
+      keyheight = unit(0.4, "cm"),
+      title.position = "top"
+    ),
+    size = guide_legend(
+      order = 2,
+      ncol = 4,    
+      title.position = "top"
+    )
+  )
+
+optical_map_plot
+```
+
+За даними від Oookla, за шість років спостережень швидкість завантаження більше 100 мб/с зареєстрована у 6935 населених пунктах — беручи усю територію України. Розмір кругів на мапі — це кількість пристроїв, з яких робилися тести. Найбільше, майже 26 тисяч пристроїв в середньому на квартал, були у Києві. Оскільки, напротивагу, у 61.5% охоплених Ookla населених пунктів є дані з менш як одного пристрою в середньому на рік (для такої швидкості), для відображення пропорцій кругів використана логарифмічна трансформація зі зміщенням, *log(x+1)*.
+
+```{r include = FALSE}
+# це скільки населених пукнтів при 100 мб/с від Укли
+agg_fin_sf |> st_drop_geometry() |> nrow() -
+agg_fin_sf |> st_drop_geometry() |>
+  filter(is.na(total_devices)) |> nrow()
+
+# скільки з них з <1 девайсом в середньому/рік
+agg_fin_sf |> st_drop_geometry() |>
+  filter(!is.na(total_devices)) |> 
+  count(total_devices) |> 
+  mutate(total_devices_by6 = total_devices/6) |> 
+  filter(total_devices_by6 < 1) |> 
+  summarise(sum_n = sum(n)) #4265
+
+4265/6935
+```
+
+### Оптичний інтернет в підконтрольних населених пунктах
+
+```{r include = FALSE}
+optical_int_data_for_table <- 
+pidkontr_np_jan25 |>
+  left_join(agg_fin_sf |> st_drop_geometry(),
+            join_by(ADM4_PCODE)) |>
+  count(internet_type) |> arrange(desc(n))
+
+optical_int_data_for_table$internet_type[1] <- "Є оптика (лише 1-Т)"
+optical_int_data_for_table$internet_type[2] <- "Немає оптики/або даних"
+optical_int_data_for_table$internet_type[3] <- "Є оптика (обидва джерела)"
+optical_int_data_for_table$internet_type[4] <- "Є інші технології (1-Т)"
+optical_int_data_for_table$internet_type[5] <- "Є оптика (лише Ookla)"
+
+
+# Calculate total
+total_n <- sum(optical_int_data_for_table$n)
+```
+
+Станом на 25 січня 2025 року, за даними ISW, на підконтрольній Україні території (не рахуючи Курську область РФ), знаходяться 25,804 населені пункти. На основі даних з регуляторної звітності (1-Т) і даних від Ookla, покриття оптичним інтернетом виглядає так:
+
+```{r echo = FALSE}
+library(gt)
+# Create and style the GT table
+optical_int_data_for_table %>%
+  mutate(
+    percent = n / total_n * 100
+  ) %>%
+  add_row(
+    internet_type = "Total",
+    n = sum(.$n),
+    percent = sum(.$percent)
+  ) %>%
+  gt() %>%
+  tab_header(
+    title = "Оптичний інтернет у підконтрольних НП",
+    subtitle = "За даними 1-Т та Ookla. У період 2019-2024"
+  ) %>%
+  fmt_number(
+    columns = c(n),
+    decimals = 0,
+    use_seps = TRUE
+  ) %>%
+  fmt_percent(
+    columns = c(percent),
+    decimals = 1,
+    scale_values = FALSE
+  ) %>%
+  cols_label(
+    internet_type = "Статус",
+    n = "Кількість НП",
+    percent = "Частка"
+  ) %>%
+  tab_style(
+    style = list(
+      cell_fill(color = "#f7f7f7"),
+      cell_text(weight = "bold")
+    ),
+    locations = cells_column_labels()
+  ) %>%
+  tab_style(
+    style = list(
+      cell_text(weight = "bold")
+    ),
+    locations = cells_title()
+  ) %>%
+  opt_row_striping()
+
+
+```
+
+Об'єднуючи дані від Ookla і від 1-Т разом, ці розрахунки показують, що у 16,678 населених пунктах, або у 64.6% підконтрольних населених пунктах, вже є оптичний інтернет.
+
+### Потреба верифікації
+
+Наведені дані покриття оптичним інтернетом — це оцінка. З огляду на описаний підхід, сказати точно, чи покритий населений пункт оптичним інтернетом станом на зараз можна не у кожному випадку:
+
+-   І на основі даних з 1-Т, і з даних Ookla висновок про присутність оптоволокна у населеному пункті зроблено у випадку, якщо описана умова (звітування про присутність абонетів для 1-Т чи швидкість \> 100 мб/с для Ookla) реєструвалася хоча б за один квартал за увесь період спостережень. Станом на кінець 2024 року ситуація з підключенням у населеному пункті могла змінитися.
+
+-   Швидкість завантаження100 мб/с не обов'язково означає присутність оптики у населеному пункті, особливо якщо за цілий рік така швидкість реєструвалася менш як з одного пристрою у населеному пункті.
+
+З іншого боку, є частина населених пунктів, які фактично мають оптику, але не потрапили на цю мапу через те, що частина провайдерів не звітує про свою присутність, а також через те, що Ookla не є єдиним сервісом з тестування швидкості підключення, яким користуються провайдери. Крім того, обираючи поріг швидкості завантаження для припущення про наявність оптики, слід зважати на те, що:
+
+> За даними учасників ринку, технічні можливості провайдерів дозволяють забезпечувати швидкість Інтернету і до 100 Мбіт/с, і до 1 Гбіт/с (завдяки широкому використанню оптоволоконних мереж – 88,1% ліній фіксованого доступу за даними НКЕК), але споживачі обирають пакети з нижчими швидкостями через доступність тарифів[^3].
+
+[^3]: [Аналітичні матеріали](https://thedigital.gov.ua/storage/uploads/files/%D0%90%D0%BD%D0%B0%D0%BB%D1%96%D1%82%D0%B8%D1%87%D0%BD%D1%96%20%D0%BC%D0%B0%D1%82%D0%B5%D1%80%D1%96%D0%B0%D0%BB%D0%B8.pdf) до проєкту згаданої Стратегії, ст. 47.
+
+Таким чином, цю мапу з оцінкою покриття населених пунктів оптичним інтернетом слід розглядати як орієнтир, що потребує подальшої верифікації.
